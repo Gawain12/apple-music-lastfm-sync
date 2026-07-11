@@ -1,3 +1,4 @@
 lastfm-sync
 lastfm-history*.jsonl
+*.env
 .DS_Store

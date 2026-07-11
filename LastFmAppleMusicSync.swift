@@ -8,6 +8,8 @@ private let apiURL = URL(string: "https://ws.audioscrobbler.com/2.0/")!
 private let apiAccountURL = URL(string: "https://www.last.fm/api/account/create")!
 private let keychainService = "Codex Apple Music Last.fm Sync"
 private let keychainAccount = NSUserName()
+private let environmentCredentialsURL = FileManager.default.homeDirectoryForCurrentUser
+    .appendingPathComponent(".config/apple-music-lastfm-sync.env")
 private let stateURL = FileManager.default.homeDirectoryForCurrentUser
     .appendingPathComponent("Library/Application Support/Apple Music Last.fm Sync/state.json")
 private let launchAgentLabel = "com.gawain12.apple-music-lastfm-sync"
@@ -49,6 +51,8 @@ struct SyncState: Codable {
     var lastError: String?
     var lastScanCount: Int = 0
     var source: String = "computer"
+    var runs: [SyncRun] = []
+    var timestampVersion: Int = 2
 
     private enum CodingKeys: String, CodingKey {
         case submitted
@@ -60,6 +64,8 @@ struct SyncState: Codable {
         case lastError
         case lastScanCount
         case source
+        case runs
+        case timestampVersion
     }
 
     init() {}
@@ -73,7 +79,7 @@ struct SyncState: Codable {
                 SubmissionRecord(recordedAt: $0, source: "computer", result: "accepted")
             }
         }
-        pending = try container.decodeIfPresent([Track].self, forKey: .pending) ?? []
+        let storedPending = try container.decodeIfPresent([Track].self, forKey: .pending) ?? []
         scanCursor = try container.decodeIfPresent(Int.self, forKey: .scanCursor)
         lastScanStartedAt = try container.decodeIfPresent(Int.self, forKey: .lastScanStartedAt)
         lastScanCompletedAt = try container.decodeIfPresent(Int.self, forKey: .lastScanCompletedAt)
@@ -81,6 +87,34 @@ struct SyncState: Codable {
         lastError = try container.decodeIfPresent(String.self, forKey: .lastError)
         lastScanCount = try container.decodeIfPresent(Int.self, forKey: .lastScanCount) ?? 0
         source = try container.decodeIfPresent(String.self, forKey: .source) ?? "computer"
+        runs = try container.decodeIfPresent([SyncRun].self, forKey: .runs) ?? []
+        let storedTimestampVersion = try container.decodeIfPresent(Int.self, forKey: .timestampVersion) ?? 1
+        if storedTimestampVersion < 2 {
+            let correction = TimeZone.current.secondsFromGMT()
+            pending = storedPending.map { track in
+                Track(
+                    persistentID: track.persistentID,
+                    title: track.title,
+                    artist: track.artist,
+                    album: track.album,
+                    albumArtist: track.albumArtist,
+                    duration: track.duration,
+                    timestamp: track.timestamp - correction
+                )
+            }
+            submitted = submitted.reduce(into: [:]) { result, item in
+                let parts = item.key.split(separator: ":")
+                guard let oldTimestamp = parts.last.flatMap({ Int($0) }) else {
+                    result[item.key] = item.value
+                    return
+                }
+                let oldPrefix = parts.dropLast().joined(separator: ":")
+                result["\(oldPrefix):\(oldTimestamp - correction)"] = item.value
+            }
+        } else {
+            pending = storedPending
+        }
+        timestampVersion = 2
     }
 }
 
@@ -92,6 +126,32 @@ struct RemoteScrobble {
     let source: String
 }
 
+struct SyncRun: Codable {
+    var startedAt: Int
+    var completedAt: Int?
+    var mode: String
+    var scanned: Int
+    var queued: Int
+    var submitted: Int
+    var deduplicated: Int
+    var ignored: Int
+    var status: String
+    var error: String?
+
+    init(startedAt: Int, mode: String) {
+        self.startedAt = startedAt
+        self.completedAt = nil
+        self.mode = mode
+        self.scanned = 0
+        self.queued = 0
+        self.submitted = 0
+        self.deduplicated = 0
+        self.ignored = 0
+        self.status = "started"
+        self.error = nil
+    }
+}
+
 struct RecentTracksPage {
     let tracks: [RemoteScrobble]
     let rawTracks: [[String: Any]]
@@ -101,6 +161,11 @@ struct RecentTracksPage {
 }
 
 struct ScrobbleResult {
+    let acceptedCount: Int
+    let items: [ScrobbleItemResult]
+}
+
+struct ScrobbleItemResult {
     let accepted: Bool
     let ignoredCode: Int?
 }
@@ -161,6 +226,110 @@ func writeKeychain(_ credentials: Credentials) throws {
     }
 }
 
+func readEnvironmentFile() -> [String: String] {
+    guard let data = try? Data(contentsOf: environmentCredentialsURL),
+          let contents = String(data: data, encoding: .utf8) else {
+        return [:]
+    }
+    var values: [String: String] = [:]
+    for rawLine in contents.components(separatedBy: .newlines) {
+        var line = rawLine.trimmingCharacters(in: .whitespacesAndNewlines)
+        if line.isEmpty || line.hasPrefix("#") { continue }
+        if line.hasPrefix("export ") { line.removeFirst(7) }
+        guard let separator = line.firstIndex(of: "=") else { continue }
+        let key = String(line[..<separator]).trimmingCharacters(in: .whitespaces)
+        var value = String(line[line.index(after: separator)...])
+        if value.count >= 2,
+           ((value.first == "\"" && value.last == "\"") || (value.first == "'" && value.last == "'")) {
+            value.removeFirst()
+            value.removeLast()
+        }
+        values[key] = value
+    }
+    return values
+}
+
+func environmentCredentials() -> Credentials? {
+    let fileValues = readEnvironmentFile()
+    let processValues = ProcessInfo.processInfo.environment
+    func value(_ key: String) -> String? {
+        processValues[key] ?? fileValues[key]
+    }
+    guard let apiKey = value("LASTFM_API_KEY"),
+          let sharedSecret = value("LASTFM_SHARED_SECRET"),
+          !apiKey.isEmpty,
+          !sharedSecret.isEmpty else {
+        return nil
+    }
+    return Credentials(
+        api_key: apiKey,
+        shared_secret: sharedSecret,
+        session_key: value("LASTFM_SESSION_KEY"),
+        username: value("LASTFM_USERNAME")
+    )
+}
+
+func readCredentials() throws -> Credentials {
+    if let credentials = environmentCredentials() { return credentials }
+    do {
+        return try readKeychain()
+    } catch {
+        throw SyncError.message("Credentials are not configured. Run 'configure' or set LASTFM_API_KEY and LASTFM_SHARED_SECRET.")
+    }
+}
+
+func writeEnvironmentCredentials(_ credentials: Credentials) throws {
+    let values = [
+        "LASTFM_API_KEY": credentials.api_key,
+        "LASTFM_SHARED_SECRET": credentials.shared_secret,
+        "LASTFM_SESSION_KEY": credentials.session_key ?? "",
+        "LASTFM_USERNAME": credentials.username ?? ""
+    ]
+    guard values.values.allSatisfy({ !$0.contains(where: { $0.isNewline }) }) else {
+        throw SyncError.message("Credential values cannot contain newlines.")
+    }
+    let contents = values
+        .sorted { $0.key < $1.key }
+        .map { "\($0.key)=\($0.value)" }
+        .joined(separator: "\n") + "\n"
+    let directory = environmentCredentialsURL.deletingLastPathComponent()
+    try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+    try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: directory.path)
+    try Data(contents.utf8).write(to: environmentCredentialsURL, options: .atomic)
+    try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: environmentCredentialsURL.path)
+}
+
+func deleteKeychainCredentials() throws {
+    let query: [String: Any] = [
+        kSecClass as String: kSecClassGenericPassword,
+        kSecAttrService as String: keychainService,
+        kSecAttrAccount as String: keychainAccount
+    ]
+    let status = SecItemDelete(query as CFDictionary)
+    guard status == errSecSuccess || status == errSecItemNotFound else {
+        throw SyncError.message("Could not remove the legacy Keychain item: \(status)")
+    }
+}
+
+func migrateCredentialsToEnvironment() throws {
+    let credentials = try readCredentials()
+    try writeEnvironmentCredentials(credentials)
+    try deleteKeychainCredentials()
+    print("Credentials moved to \(environmentCredentialsURL.path) and removed from the legacy Keychain item.")
+}
+
+func credentialSourceDescription() -> String {
+    let environment = ProcessInfo.processInfo.environment
+    if !environment["LASTFM_API_KEY", default: ""].isEmpty,
+       !environment["LASTFM_SHARED_SECRET", default: ""].isEmpty {
+        return "process environment"
+    }
+    if FileManager.default.fileExists(atPath: environmentCredentialsURL.path) {
+        return environmentCredentialsURL.path
+    }
+    return "legacy Keychain fallback"
+}
+
 func runAppleScript(_ source: String) throws -> String {
     let process = Process()
     let input = Pipe()
@@ -219,7 +388,7 @@ end tell
     ]
 }
 
-func recentTracks(sinceDays: Int, sinceTimestamp: Int? = nil) throws -> [Track] {
+func recentTracks(sinceDays: Int, sinceTimestamp: Int? = nil, allLibrary: Bool = false) throws -> [Track] {
     let seconds = max(0, sinceDays) * 86400
     let cutoffExpression: String
     if let sinceTimestamp {
@@ -227,19 +396,24 @@ func recentTracks(sinceDays: Int, sinceTimestamp: Int? = nil) throws -> [Track] 
     } else {
         cutoffExpression = "(current date) - \(seconds)"
     }
+    let matchingTracksExpression = allLibrary
+        ? "every file track of library playlist 1 whose played date is not missing value"
+        : "every file track of library playlist 1 whose played date is greater than cutoffDate"
+    let dateFilterExpression = allLibrary ? "true" : "pDate is greater than cutoffDate"
     let source = """
 tell application "Music"
     set epochDate to date "Thursday, January 1, 1970 at 00:00:00"
+    set gmtOffset to time to GMT
     set cutoffDate to \(cutoffExpression)
     set rs to ASCII character 30
     set fs to ASCII character 31
     set rows to {}
-    set matchingTracks to every file track of library playlist 1 whose played date is greater than cutoffDate
+    set matchingTracks to \(matchingTracksExpression)
     repeat with t in matchingTracks
         try
             set pDate to played date of t
-            if pDate is not missing value and pDate is greater than cutoffDate then
-                set playedSeconds to (pDate - epochDate) as integer
+            if pDate is not missing value and \(dateFilterExpression) then
+                set playedSeconds to ((pDate - epochDate) as integer) - gmtOffset
                 set rowText to (persistent ID of t as text) & fs & (name of t as text) & fs & (artist of t as text) & fs & (album of t as text) & fs & (album artist of t as text) & fs & (duration of t as text) & fs & (playedSeconds as text)
                 set end of rows to rowText
             end if
@@ -319,7 +493,7 @@ func apiCall(credentials: Credentials, method: String, parameters: [String: Stri
         throw SyncError.message("Last.fm HTTP status \(httpStatus) with invalid JSON.")
     }
     if let error = json["error"] as? Int {
-        throw SyncError.message("Last.fm API error \(error): \(json["message"] as? String ?? "unknown error")")
+        throw SyncError.message("Last.fm \(method) API error \(error): \(json["message"] as? String ?? "unknown error")")
     }
     guard (200..<300).contains(httpStatus) else {
         throw SyncError.message("Last.fm HTTP status \(httpStatus)")
@@ -442,7 +616,7 @@ func setup() {
 }
 
 func authorize() async throws {
-    var credentials = try readKeychain()
+    var credentials = try readCredentials()
     let tokenResponse = try await apiCall(credentials: credentials, method: "auth.getToken", parameters: [:])
     guard let token = tokenResponse["token"] as? String else {
         throw SyncError.message("Last.fm did not return an auth token.")
@@ -464,11 +638,12 @@ func authorize() async throws {
     }
     credentials.session_key = key
     credentials.username = username
-    try writeKeychain(credentials)
+    try writeEnvironmentCredentials(credentials)
+    try? deleteKeychainCredentials()
     print("Authorized as \(username).")
 }
 
-func configure() throws {
+func configure(useKeychain: Bool) throws {
     print("If you do not have an API account yet, run 'setup' first.")
     print("Last.fm API key:", terminator: " ")
     guard let apiKey = readLine(), !apiKey.isEmpty else {
@@ -481,8 +656,15 @@ func configure() throws {
     guard !sharedSecret.isEmpty else {
         throw SyncError.message("Shared secret is required.")
     }
-    try writeKeychain(Credentials(api_key: apiKey, shared_secret: sharedSecret, session_key: nil, username: nil))
-    print("API credentials saved to the macOS Keychain.")
+    let credentials = Credentials(api_key: apiKey, shared_secret: sharedSecret, session_key: nil, username: nil)
+    if useKeychain {
+        try writeKeychain(credentials)
+        print("API credentials saved to the macOS Keychain.")
+    } else {
+        try writeEnvironmentCredentials(credentials)
+        try? deleteKeychainCredentials()
+        print("API credentials saved to \(environmentCredentialsURL.path) with permissions 600.")
+    }
 }
 
 func loadState() throws -> SyncState {
@@ -516,19 +698,20 @@ func scrobbleBatch(credentials: Credentials, tracks: [Track]) async throws -> Sc
     let scrobbles = response["scrobbles"] as? [String: Any]
     let attributes = scrobbles?["@attr"] as? [String: Any]
     let accepted = integerValue(attributes?["accepted"]) ?? 0
-    let ignoredCode: Int?
-    if let one = scrobbles?["scrobble"] as? [String: Any],
-       let ignored = one["ignoredMessage"] as? [String: Any] {
-        let code = integerValue(ignored["code"]) ?? 0
-        ignoredCode = code == 0 ? nil : code
-    } else if let list = scrobbles?["scrobble"] as? [[String: Any]],
-              let ignored = list.first?["ignoredMessage"] as? [String: Any] {
-        let code = integerValue(ignored["code"]) ?? 0
-        ignoredCode = code == 0 ? nil : code
+    let responseItems: [[String: Any]]
+    if let one = scrobbles?["scrobble"] as? [String: Any] {
+        responseItems = [one]
+    } else if let list = scrobbles?["scrobble"] as? [[String: Any]] {
+        responseItems = list
     } else {
-        ignoredCode = nil
+        responseItems = []
     }
-    return ScrobbleResult(accepted: accepted > 0, ignoredCode: ignoredCode)
+    let items = responseItems.map { item in
+        let ignored = item["ignoredMessage"] as? [String: Any]
+        let code = integerValue(ignored?["code"]) ?? 0
+        return ScrobbleItemResult(accepted: code == 0, ignoredCode: code == 0 ? nil : code)
+    }
+    return ScrobbleResult(acceptedCount: accepted, items: items)
 }
 
 func normalized(_ value: String) -> String {
@@ -561,8 +744,8 @@ func isPermanentIgnored(_ code: Int) -> Bool {
     [1, 2, 3, 4].contains(code)
 }
 
-func syncHistory(sinceDays: Int, explicitLookback: Bool, dryRun: Bool) async throws {
-    let credentials = try readKeychain()
+func syncHistory(sinceDays: Int, explicitLookback: Bool, allLibrary: Bool, confirmFull: Bool, dryRun: Bool) async throws {
+    let credentials = try readCredentials()
     guard let sessionKey = credentials.session_key, !sessionKey.isEmpty else {
         throw SyncError.message("Run 'auth' first.")
     }
@@ -570,20 +753,47 @@ func syncHistory(sinceDays: Int, explicitLookback: Bool, dryRun: Bool) async thr
         throw SyncError.message("Run 'auth' first so the Last.fm account is known.")
     }
     var state = try loadState()
-    let now = Int(Date().timeIntervalSince1970)
+    _ = sessionKey
+    let startedAt = Int(Date().timeIntervalSince1970)
+    let mode = allLibrary ? "all-library" : (explicitLookback ? "lookback-\(sinceDays)d" : "cursor")
+    state.lastScanStartedAt = startedAt
+    state.lastError = nil
+    state.runs.append(SyncRun(startedAt: startedAt, mode: mode))
+    if state.runs.count > 100 {
+        state.runs.removeFirst(state.runs.count - 100)
+    }
+    let runIndex = state.runs.count - 1
+    try saveState(state)
+
     let cursor = explicitLookback ? nil : state.scanCursor.map { max(0, $0 - 600) }
-    let tracks = try recentTracks(sinceDays: sinceDays, sinceTimestamp: cursor)
+    let tracks: [Track]
+    do {
+        tracks = try recentTracks(sinceDays: sinceDays, sinceTimestamp: cursor, allLibrary: allLibrary)
+    } catch {
+        state.lastError = error.localizedDescription
+        state.runs[runIndex].status = "error"
+        state.runs[runIndex].completedAt = Int(Date().timeIntervalSince1970)
+        state.runs[runIndex].error = error.localizedDescription
+        try? saveState(state)
+        throw error
+    }
+
     let merged = mergeTracks(state.pending, tracks)
-    state.lastScanStartedAt = now
-    state.lastScanCompletedAt = now
-    state.scanCursor = now
+    let scanCompletedAt = Int(Date().timeIntervalSince1970)
+    state.lastScanCompletedAt = scanCompletedAt
+    state.scanCursor = scanCompletedAt
     state.lastScanCount = tracks.count
     state.source = "computer"
+    state.runs[runIndex].scanned = tracks.count
+    state.runs[runIndex].queued = merged.count
     print("Apple Music scan: \(tracks.count); queued: \(merged.count)")
     if dryRun {
         for track in merged where state.submitted[fingerprint(track)] == nil {
             print("DRY RUN  \(track.artist) - \(track.title)  (\(track.timestamp))")
         }
+        state.runs[runIndex].status = "dry-run"
+        state.runs[runIndex].completedAt = Int(Date().timeIntervalSince1970)
+        try saveState(state)
         return
     }
 
@@ -591,24 +801,42 @@ func syncHistory(sinceDays: Int, explicitLookback: Bool, dryRun: Bool) async thr
     try saveState(state)
     guard !state.pending.isEmpty else {
         state.lastError = nil
+        state.runs[runIndex].status = "complete"
+        state.runs[runIndex].completedAt = Int(Date().timeIntervalSince1970)
         try saveState(state)
         print("Nothing new to submit.")
         return
     }
+    if allLibrary && state.pending.count > 100 && !confirmFull {
+        state.lastError = "Full-library upload cancelled before submission."
+        state.runs[runIndex].status = "cancelled"
+        state.runs[runIndex].completedAt = Int(Date().timeIntervalSince1970)
+        try saveState(state)
+        print("Full library queued \(state.pending.count) records. Nothing was uploaded.")
+        print("Review with 'list --all', then rerun with 'sync --all --yes' to confirm.")
+        return
+    }
 
     do {
-        let firstTimestamp = state.pending.map(\.timestamp).min() ?? now
-        let lastTimestamp = state.pending.map(\.timestamp).max() ?? now
-        let remote = try await allRecentScrobbles(
-            credentials: credentials,
-            username: username,
-            from: max(0, firstTimestamp - 30),
-            to: lastTimestamp + 30
-        )
+        let firstTimestamp = state.pending.map(\.timestamp).min() ?? scanCompletedAt
+        let lastTimestamp = state.pending.map(\.timestamp).max() ?? scanCompletedAt
+        let remote: [RemoteScrobble]
+        if state.pending.count > 500 {
+            remote = []
+            print("Remote duplicate check skipped for \(state.pending.count) records; local fingerprints remain active.")
+        } else {
+            remote = try await allRecentScrobbles(
+                credentials: credentials,
+                username: username,
+                from: max(0, firstTimestamp - 30),
+                to: lastTimestamp + 30
+            )
+        }
         var submitted = 0
         var alreadyPresent = 0
         var ignored = 0
         let queue = state.pending
+        var uploadQueue: [Track] = []
         for track in queue {
             let key = fingerprint(track)
             if remote.contains(where: { matchesRemote(track, $0) }) {
@@ -620,48 +848,215 @@ func syncHistory(sinceDays: Int, explicitLookback: Bool, dryRun: Bool) async thr
                 state.pending.removeAll { fingerprint($0) == key }
                 state.lastSubmittedAt = Int(Date().timeIntervalSince1970)
                 alreadyPresent += 1
-                try saveState(state)
-                continue
-            }
-
-            let result = try await scrobbleBatch(credentials: credentials, tracks: [track])
-            if result.accepted {
-                state.submitted[key] = SubmissionRecord(
-                    recordedAt: Int(Date().timeIntervalSince1970),
-                    source: "computer",
-                    result: "accepted"
-                )
-                state.pending.removeAll { fingerprint($0) == key }
-                state.lastSubmittedAt = Int(Date().timeIntervalSince1970)
-                submitted += 1
-                try saveState(state)
-            } else if let code = result.ignoredCode, isPermanentIgnored(code) {
-                state.submitted[key] = SubmissionRecord(
-                    recordedAt: Int(Date().timeIntervalSince1970),
-                    source: "computer",
-                    result: "ignored-\(code)"
-                )
-                state.pending.removeAll { fingerprint($0) == key }
-                ignored += 1
-                print("Ignored code \(code): \(track.artist) - \(track.title)")
-                try saveState(state)
             } else {
-                print("Not accepted; kept pending: \(track.artist) - \(track.title)")
+                uploadQueue.append(track)
             }
-            if !state.pending.isEmpty {
-                try await Task.sleep(nanoseconds: 1_500_000_000)
+        }
+        if alreadyPresent > 0 { try saveState(state) }
+
+        var start = 0
+        while start < uploadQueue.count {
+            let end = min(start + 50, uploadQueue.count)
+            let batch = Array(uploadQueue[start..<end])
+            let result = try await scrobbleBatch(credentials: credentials, tracks: batch)
+            let hasPerTrackResults = result.items.count == batch.count
+            for (offset, track) in batch.enumerated() {
+                let item = hasPerTrackResults ? result.items[offset] : nil
+                let accepted = item?.accepted == true || (!hasPerTrackResults && result.acceptedCount == batch.count)
+                if accepted {
+                    let key = fingerprint(track)
+                    state.submitted[key] = SubmissionRecord(
+                        recordedAt: Int(Date().timeIntervalSince1970),
+                        source: "computer",
+                        result: "accepted"
+                    )
+                    state.pending.removeAll { fingerprint($0) == key }
+                    state.lastSubmittedAt = Int(Date().timeIntervalSince1970)
+                    submitted += 1
+                } else if let code = item?.ignoredCode, isPermanentIgnored(code) {
+                    let key = fingerprint(track)
+                    state.submitted[key] = SubmissionRecord(
+                        recordedAt: Int(Date().timeIntervalSince1970),
+                        source: "computer",
+                        result: "ignored-\(code)"
+                    )
+                    state.pending.removeAll { fingerprint($0) == key }
+                    ignored += 1
+                    print("Ignored code \(code): \(track.artist) - \(track.title)")
+                }
+            }
+            if result.acceptedCount != batch.count {
+                print("Batch result: accepted \(result.acceptedCount)/\(batch.count); unresolved records stay pending.")
+            }
+            try saveState(state)
+            start = end
+            if start < uploadQueue.count {
+                try await Task.sleep(nanoseconds: 5_000_000_000)
             }
         }
         state.lastError = state.pending.isEmpty
             ? nil
             : "Some records remain pending; retry after the temporary Last.fm rejection or rate limit clears."
+        state.runs[runIndex].submitted = submitted
+        state.runs[runIndex].deduplicated = alreadyPresent
+        state.runs[runIndex].ignored = ignored
+        state.runs[runIndex].status = state.pending.isEmpty ? "complete" : "partial"
+        state.runs[runIndex].completedAt = Int(Date().timeIntervalSince1970)
         try saveState(state)
         print("Submitted: \(submitted); already on Last.fm: \(alreadyPresent); permanently ignored: \(ignored); pending: \(state.pending.count)")
     } catch {
         state.lastError = error.localizedDescription
+        state.runs[runIndex].status = "error"
+        state.runs[runIndex].completedAt = Int(Date().timeIntervalSince1970)
+        state.runs[runIndex].error = error.localizedDescription
         try saveState(state)
         throw error
     }
+}
+
+func durationText(_ duration: Double) -> String {
+    guard duration > 0 else { return "-" }
+    let seconds = Int(duration.rounded())
+    return String(format: "%d:%02d", seconds / 60, seconds % 60)
+}
+
+func jsonText(_ value: Any) -> String {
+    guard JSONSerialization.isValidJSONObject(value),
+          let data = try? JSONSerialization.data(withJSONObject: value, options: [.prettyPrinted]),
+          let text = String(data: data, encoding: .utf8) else {
+        return "{}"
+    }
+    return text
+}
+
+func topCountText(_ values: [String], limit: Int = 5) -> String {
+    var counts: [String: Int] = [:]
+    for value in values where !value.isEmpty {
+        counts[value, default: 0] += 1
+    }
+    return counts
+        .sorted { left, right in
+            if left.value == right.value { return left.key < right.key }
+            return left.value > right.value
+        }
+        .prefix(limit)
+        .map { "\($0.key) (\($0.value))" }
+        .joined(separator: ", ")
+}
+
+func sampledRows(_ rows: [[String: Any]], limit: Int) -> ([[String: Any]], Int) {
+    let safeLimit = max(2, limit)
+    guard rows.count > safeLimit else { return (rows, 0) }
+    let headCount = safeLimit / 2
+    let tailCount = safeLimit - headCount
+    let sample = Array(rows.prefix(headCount)) + Array(rows.suffix(tailCount))
+    return (sample, rows.count - sample.count)
+}
+
+func listHistory(sinceDays: Int, allLibrary: Bool, asJSON: Bool, limit: Int) async throws {
+    let state = try loadState()
+    let tracks = try recentTracks(sinceDays: sinceDays, allLibrary: allLibrary)
+    let merged = mergeTracks(state.pending, tracks)
+    var remote: [RemoteScrobble] = []
+    var remoteCheck = "not checked"
+    if merged.count > 500 {
+        remoteCheck = "skipped for large set"
+    } else if let credentials = try? readCredentials(),
+       let username = credentials.username,
+       !username.isEmpty,
+       let firstTimestamp = merged.map(\.timestamp).min(),
+       let lastTimestamp = merged.map(\.timestamp).max() {
+        do {
+            remote = try await allRecentScrobbles(
+                credentials: credentials,
+                username: username,
+                from: max(0, firstTimestamp - 30),
+                to: lastTimestamp + 30
+            )
+            remoteCheck = "checked"
+        } catch {
+            remoteCheck = "unavailable"
+        }
+    }
+
+    var rows: [[String: Any]] = []
+    for (index, track) in merged.enumerated() {
+        let key = fingerprint(track)
+        let recorded = state.submitted[key]
+        let status: String
+        if let recorded {
+            status = recorded.result
+        } else if remoteCheck == "checked" && remote.contains(where: { matchesRemote(track, $0) }) {
+            status = "already-on-lastfm"
+        } else {
+            status = "pending"
+        }
+        rows.append([
+            "index": index + 1,
+            "played_at": formattedTimestamp(track.timestamp),
+            "timestamp": track.timestamp,
+            "source": recorded?.source ?? "computer",
+            "status": status,
+            "artist": track.artist,
+            "track": track.title,
+            "album": track.album,
+            "album_artist": track.albumArtist,
+            "duration_seconds": track.duration,
+            "persistent_id": track.persistentID
+        ])
+    }
+
+    let statusValues = rows.compactMap { $0["status"] as? String }
+    let artistValues = rows.compactMap { $0["artist"] as? String }
+    let albumValues = rows.compactMap { $0["album"] as? String }
+    let durationTotal = rows.reduce(0.0) { total, row in
+        total + (row["duration_seconds"] as? Double ?? 0)
+    }
+    let timestamps = rows.compactMap { $0["timestamp"] as? Int }
+    let (displayRows, omittedCount) = sampledRows(rows, limit: limit)
+
+    if asJSON {
+        print(jsonText([
+            "mode": allLibrary ? "all-library" : "lookback",
+            "scan_count": tracks.count,
+            "row_count": rows.count,
+            "remote_check": remoteCheck,
+            "omitted_count": omittedCount,
+            "status_counts": Dictionary(grouping: statusValues, by: { $0 }).mapValues(\.count),
+            "total_duration_seconds": durationTotal,
+            "earliest_played_at": formattedTimestamp(timestamps.min()),
+            "latest_played_at": formattedTimestamp(timestamps.max()),
+            "top_artists": topCountText(artistValues),
+            "top_albums": topCountText(albumValues),
+            "records": displayRows
+        ]))
+        return
+    }
+
+    let statusCounts = Dictionary(grouping: statusValues, by: { $0 }).mapValues(\.count)
+    let statusSummary = statusCounts.keys.sorted().map { "\($0)=\(statusCounts[$0] ?? 0)" }.joined(separator: ", ")
+    print("Mode: \(allLibrary ? "full library" : "last \(sinceDays) days"); Apple Music scan: \(tracks.count); rows: \(rows.count)")
+    print("Status: \(statusSummary.isEmpty ? "none" : statusSummary); Last.fm duplicate check: \(remoteCheck)")
+    print("Time range: \(formattedTimestamp(timestamps.min())) -> \(formattedTimestamp(timestamps.max())); total duration: \(durationText(durationTotal))")
+    print("Top artists: \(topCountText(artistValues).isEmpty ? "none" : topCountText(artistValues))")
+    print("Top albums: \(topCountText(albumValues).isEmpty ? "none" : topCountText(albumValues))")
+    if omittedCount > 0 {
+        print("Showing \(displayRows.count) sample rows; omitted \(omittedCount). Use --limit N or --full for more detail.")
+    }
+    print(" #  PLAYED (UTC)             SOURCE    STATUS                 ARTIST - TRACK | ALBUM | LENGTH")
+    print("---  ----------------------- --------- ---------------------- --------------------------------")
+    for row in displayRows {
+        let index = row["index"] as? Int ?? 0
+        let playedAt = row["played_at"] as? String ?? ""
+        let source = row["source"] as? String ?? ""
+        let status = row["status"] as? String ?? ""
+        let artist = row["artist"] as? String ?? ""
+        let title = row["track"] as? String ?? ""
+        let album = row["album"] as? String ?? ""
+        let duration = durationText(row["duration_seconds"] as? Double ?? 0)
+        print(String(format: "%2d  %@  %-9@ %-22@ %@ - %@ | %@ | %@", index, playedAt, source, status, artist, title, album, duration))
+    }
+    print("No data was uploaded. Review the rows above, then run 'sync --since-days \(sinceDays)' to submit them.")
 }
 
 func resolvedURL(_ path: String) -> URL {
@@ -675,7 +1070,7 @@ func resolvedURL(_ path: String) -> URL {
 }
 
 func downloadHistory(outputPath: String, from: Int?, to: Int?, maxPages: Int?) async throws {
-    let credentials = try readKeychain()
+    let credentials = try readCredentials()
     guard let username = credentials.username, !username.isEmpty else {
         throw SyncError.message("Run 'auth' first.")
     }
@@ -734,8 +1129,9 @@ func formattedTimestamp(_ timestamp: Int?) -> String {
 
 func printStatus() throws {
     let state = try loadState()
-    if let credentials = try? readKeychain() {
+    if let credentials = try? readCredentials() {
         print("Last.fm account: \(credentials.username ?? "configured, not authorized")")
+        print("Credential source: \(credentialSourceDescription())")
     } else {
         print("Last.fm account: not configured")
     }
@@ -745,6 +1141,11 @@ func printStatus() throws {
     print("Last scan: \(formattedTimestamp(state.lastScanCompletedAt))")
     print("Last submitted or deduplicated: \(formattedTimestamp(state.lastSubmittedAt))")
     print("Last error: \(state.lastError ?? "none")")
+    print("Recent runs: \(state.runs.count)")
+    for run in state.runs.suffix(5).reversed() {
+        let completion = formattedTimestamp(run.completedAt)
+        print("  \(formattedTimestamp(run.startedAt)) -> \(completion) | \(run.mode) | \(run.status) | scanned=\(run.scanned) queued=\(run.queued) submitted=\(run.submitted) dedup=\(run.deduplicated) ignored=\(run.ignored)")
+    }
     print("State file: \(stateURL.path)")
 }
 
@@ -831,7 +1232,7 @@ func scheduleStatus() {
 }
 
 func verify() async throws {
-    let credentials = try readKeychain()
+    let credentials = try readCredentials()
     guard let username = credentials.username else { throw SyncError.message("Run 'auth' first.") }
     let response = try await apiCall(credentials: credentials, method: "user.getRecentTracks", parameters: ["user": username, "limit": "5"], signed: false)
     guard let recent = response["recenttracks"] as? [String: Any] else { return }
@@ -848,13 +1249,18 @@ func verify() async throws {
 }
 
 func printUsage() {
-    print("Usage: lastfm-sync <setup|configure|auth|current|sync|status|download|schedule|verify> [options]")
+    print("Usage: lastfm-sync <setup|configure|migrate|auth|current|list|sync|status|download|schedule|verify> [options]")
     print("  setup                        Open Last.fm's API account creation page")
-    print("  configure                    Save API key and shared secret in Keychain")
+    print("  configure                    Save credentials to a user env file")
+    print("       [--keychain]            Keep using the legacy Keychain store")
+    print("  migrate                      Move legacy Keychain credentials to env file")
     print("  auth                         Open browser authorization and save session")
     print("  current                      Show the current Music.app track")
+    print("  list [--since-days N]        Inspect records; never uploads or changes state")
+    print("       [--all] [--limit N] [--full] [--json]")
     print("  sync                         Resume and submit queued Apple Music records")
     print("       [--since-days N]        Force a fresh lookback instead of the cursor")
+    print("       [--all] [--yes]         Scan every played track; --yes confirms >100 records")
     print("       [--dry-run]")
     print("  status                       Show cursor, queue, outcomes and last error")
     print("  download [options]           Export paginated Last.fm history as JSONL")
@@ -872,10 +1278,14 @@ struct LastFmAppleMusicSync {
             let args = Array(CommandLine.arguments.dropFirst())
             guard let command = args.first else { printUsage(); return }
             switch command {
+            case "help", "--help", "-h":
+                printUsage()
             case "setup":
                 setup()
             case "configure":
-                try configure()
+                try configure(useKeychain: args.contains("--keychain"))
+            case "migrate":
+                try migrateCredentialsToEnvironment()
             case "auth":
                 try await authorize()
             case "current":
@@ -884,13 +1294,40 @@ struct LastFmAppleMusicSync {
                 } else {
                     print("No current Music.app track.")
                 }
+            case "list":
+                var sinceDays = 14
+                var asJSON = false
+                var allLibrary = false
+                var limit = 100
+                var index = 1
+                while index < args.count {
+                    if args[index] == "--json" {
+                        asJSON = true
+                    } else if args[index] == "--all" {
+                        allLibrary = true
+                    } else if args[index] == "--full" {
+                        limit = Int.max
+                    } else if args[index] == "--limit", index + 1 < args.count {
+                        limit = Int(args[index + 1]) ?? 100
+                        index += 1
+                    } else if args[index] == "--since-days", index + 1 < args.count {
+                        sinceDays = Int(args[index + 1]) ?? 14
+                        index += 1
+                    }
+                    index += 1
+                }
+                try await listHistory(sinceDays: sinceDays, allLibrary: allLibrary, asJSON: asJSON, limit: limit)
             case "sync":
                 var sinceDays = 14
                 var explicitLookback = false
+                var allLibrary = false
+                var confirmFull = false
                 var dryRun = false
                 var index = 1
                 while index < args.count {
                     if args[index] == "--dry-run" { dryRun = true }
+                    else if args[index] == "--all" { allLibrary = true; explicitLookback = true }
+                    else if args[index] == "--yes" { confirmFull = true }
                     else if args[index] == "--since-days", index + 1 < args.count {
                         sinceDays = Int(args[index + 1]) ?? 14
                         explicitLookback = true
@@ -898,7 +1335,7 @@ struct LastFmAppleMusicSync {
                     }
                     index += 1
                 }
-                try await syncHistory(sinceDays: sinceDays, explicitLookback: explicitLookback, dryRun: dryRun)
+                try await syncHistory(sinceDays: sinceDays, explicitLookback: explicitLookback, allLibrary: allLibrary, confirmFull: confirmFull, dryRun: dryRun)
             case "status":
                 try printStatus()
             case "download":
