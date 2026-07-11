@@ -299,6 +299,12 @@ func writeEnvironmentCredentials(_ credentials: Credentials) throws {
     try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: environmentCredentialsURL.path)
 }
 
+func deleteEnvironmentCredentials() throws {
+    if FileManager.default.fileExists(atPath: environmentCredentialsURL.path) {
+        try FileManager.default.removeItem(at: environmentCredentialsURL)
+    }
+}
+
 func deleteKeychainCredentials() throws {
     let query: [String: Any] = [
         kSecClass as String: kSecClassGenericPassword,
@@ -659,6 +665,7 @@ func configure(useKeychain: Bool) throws {
     let credentials = Credentials(api_key: apiKey, shared_secret: sharedSecret, session_key: nil, username: nil)
     if useKeychain {
         try writeKeychain(credentials)
+        try? deleteEnvironmentCredentials()
         print("API credentials saved to the macOS Keychain.")
     } else {
         try writeEnvironmentCredentials(credentials)
