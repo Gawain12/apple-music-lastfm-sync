@@ -348,11 +348,16 @@ func syncHistory(sinceDays: Int, dryRun: Bool) async throws {
     var accepted = 0
     for start in pending.indices {
         let batch = [pending[start]]
-        accepted += try await scrobbleBatch(credentials: credentials, tracks: batch)
-        for track in batch {
-            state.submitted["\(track.persistentID):\(track.timestamp)"] = Int(Date().timeIntervalSince1970)
+        let batchAccepted = try await scrobbleBatch(credentials: credentials, tracks: batch)
+        accepted += batchAccepted
+        if batchAccepted > 0 {
+            for track in batch {
+                state.submitted["\(track.persistentID):\(track.timestamp)"] = Int(Date().timeIntervalSince1970)
+            }
+            try saveState(state)
+        } else {
+            print("Not accepted: \(batch[0].artist) - \(batch[0].title)")
         }
-        try saveState(state)
         if start + 1 < pending.count {
             try await Task.sleep(nanoseconds: 1_500_000_000)
         }

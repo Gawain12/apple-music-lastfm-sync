@@ -25,3 +25,5 @@ The first run needs a Last.fm API key and shared secret. Run `configure` to ente
 ## Notes
 
 Apple Music exposes the latest played date for each library track, not a complete per-play event log. The tool therefore imports one new event per track/date and keeps a local deduplication state file.
+
+If Last.fm returns API error 29, it is temporarily rate-limiting the account or IP. The tool leaves those records pending; retry later instead of marking them as submitted.
